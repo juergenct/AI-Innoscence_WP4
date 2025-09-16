@@ -33,6 +33,8 @@ data/
 *.parquet
 *.xlsx
 *.html
+*.log
+*.txt
 
 # IDE
 .vscode/

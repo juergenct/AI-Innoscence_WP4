@@ -8,6 +8,7 @@ import re
 import json
 import logging
 import hashlib
+import csv
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Set
@@ -250,11 +251,13 @@ class TextExtractionPipeline:
             found_keywords = [kw for kw in self.CE_KEYWORDS if kw in text_lower]
             item['keywords'] = found_keywords[:10]  # Limit to 10 keywords
         
-        # Check for Hamburg references
+        # Check for Hamburg references (already done in spider, but double-check)
         hamburg_found = any(keyword in text_lower for keyword in self.HAMBURG_KEYWORDS)
-        item['has_hamburg_reference'] = hamburg_found
         if hamburg_found:
             self.stats['hamburg_related'] += 1
+            # Don't override spider's Hamburg detection
+            if 'has_hamburg_reference' not in item:
+                item['has_hamburg_reference'] = hamburg_found
 
     def _normalize_language(self, code: str) -> str:
         """Normalize language codes to 'de', 'en', or 'un'."""
@@ -313,6 +316,140 @@ class TextExtractionPipeline:
     def close_spider(self, spider):
         """Log statistics when spider closes"""
         logger.info(f"Text extraction stats: {self.stats}")
+
+
+class LLMClassificationPipeline:
+    """
+    Real-time LLM classification during crawling
+    Classifies entities for Hamburg relevance, CE relevance, and ecosystem role
+    """
+    
+    def __init__(self):
+        self.classification_cache = {}
+        self.entity_samples = {}  # Collect samples per entity
+        self.stats = {
+            'entities_classified': 0,
+            'hamburg_relevant': 0,
+            'ce_relevant': 0,
+            'both_relevant': 0,
+        }
+        
+        # Initialize LLM classifier (lazy loading)
+        self.classifier = None
+        self.enabled = False
+        
+    def open_spider(self, spider):
+        """Initialize LLM classifier when spider opens"""
+        try:
+            from circular_scraper.utils.llm_classifier import LLMClassifier
+            self.classifier = LLMClassifier()
+            if self.classifier.check_server():
+                self.enabled = True
+                logger.info("LLM Classification Pipeline enabled")
+            else:
+                logger.warning("LLM server not available. Classification disabled.")
+        except ImportError:
+            logger.warning("LLM classifier not available. Skipping LLM classification.")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM classifier: {e}")
+    
+    def process_item(self, item, spider):
+        """Classify entity in real-time"""
+        
+        if not self.enabled or not isinstance(item, CircularEconomyItem):
+            return item
+        
+        entity_id = item.get('entity_id')
+        if not entity_id:
+            return item
+        
+        # Collect samples for this entity (max 3)
+        if entity_id not in self.entity_samples:
+            self.entity_samples[entity_id] = []
+        
+        if len(self.entity_samples[entity_id]) < 3:
+            sample = {
+                'url': item.get('url'),
+                'title': item.get('title'),
+                'meta_description': item.get('meta_description'),
+                'extracted_text': item.get('extracted_text', '')[:1000]  # First 1000 chars
+            }
+            self.entity_samples[entity_id].append(sample)
+        
+        # Check if already classified
+        if entity_id in self.classification_cache:
+            result = self.classification_cache[entity_id]
+            item['hamburg_llm'] = result.get('hamburg_related', False)
+            item['ce_llm'] = result.get('ce_related', False)
+            item['role_llm'] = result.get('role', 'Unknown')
+            item['classification_confidence'] = result.get('confidence', 0.0)
+            return item
+        
+        # Classify after collecting enough samples (or on the 3rd page)
+        if len(self.entity_samples[entity_id]) >= 3 or item.get('crawl_depth', 0) >= 2:
+            try:
+                # Prepare context for LLM
+                context = {
+                    'entity_id': entity_id,
+                    'entity_name': item.get('entity_name'),
+                    'entity_root_url': item.get('entity_root_url'),
+                    'domain': item.get('domain'),
+                    'samples': self.entity_samples[entity_id]
+                }
+                
+                # Classify with LLM
+                result = self.classifier.classify_entity(context)
+                
+                # Cache result
+                self.classification_cache[entity_id] = {
+                    'hamburg_related': result.hamburg_related,
+                    'ce_related': result.ce_related,
+                    'role': result.role,
+                    'confidence': result.confidence
+                }
+                
+                # Update spider's entity relevance based on LLM
+                if hasattr(spider, 'entity_ce_relevance'):
+                    spider.entity_ce_relevance[entity_id] = result.ce_related
+                
+                # Add to item
+                item['hamburg_llm'] = result.hamburg_related
+                item['ce_llm'] = result.ce_related
+                item['role_llm'] = result.role
+                item['classification_confidence'] = result.confidence
+                
+                # Update stats
+                self.stats['entities_classified'] += 1
+                if result.hamburg_related:
+                    self.stats['hamburg_relevant'] += 1
+                if result.ce_related:
+                    self.stats['ce_relevant'] += 1
+                if result.hamburg_related and result.ce_related:
+                    self.stats['both_relevant'] += 1
+                
+                logger.info(f"LLM classified {entity_id}: Hamburg={result.hamburg_related}, "
+                          f"CE={result.ce_related}, Role={result.role}")
+                
+            except Exception as e:
+                logger.error(f"LLM classification failed for {entity_id}: {e}")
+                item['hamburg_llm'] = item.get('has_hamburg_reference', False)
+                item['ce_llm'] = item.get('has_circular_economy_terms', False)
+                item['role_llm'] = 'Unknown'
+                item['classification_confidence'] = 0.0
+        
+        return item
+    
+    def close_spider(self, spider):
+        """Log statistics when spider closes"""
+        logger.info(f"LLM classification stats: {self.stats}")
+        
+        # Save classification results to file
+        if self.classification_cache:
+            output_file = Path('data/exports') / f"llm_classifications_{datetime.now():%Y%m%d_%H%M%S}.json"
+            output_file.parent.mkdir(exist_ok=True)
+            with open(output_file, 'w') as f:
+                json.dump(self.classification_cache, f, indent=2)
+            logger.info(f"Saved LLM classifications to {output_file}")
 
 
 class DataStoragePipeline:
@@ -378,40 +515,169 @@ class DataStoragePipeline:
         return item
     
     def _save_raw_html(self, item):
-        """Save raw HTML to separate file"""
+        """Save raw HTML organized by entity"""
         if item.get('raw_html'):
-            html_dir = self.export_dir.parent / 'raw' / self.session_id
+            # Organize by entity for better structure
+            entity_id = item.get('entity_id', 'unknown').replace('/', '_').replace('.', '_')
+            entity_name = re.sub(r'[^\w\s-]', '', item.get('entity_name', entity_id))[:50]
+            
+            # Create entity-specific directory
+            html_dir = self.export_dir.parent / 'raw' / self.session_id / 'entities' / f"{entity_name}_{entity_id}"
             html_dir.mkdir(parents=True, exist_ok=True)
             
-            # Create filename from URL
+            # Create descriptive filename
             url_hash = hashlib.md5(item['url'].encode()).hexdigest()[:8]
-            filename = f"{item.get('domain', 'unknown')}_{url_hash}.html"
+            page_title = re.sub(r'[^\w\s-]', '', item.get('title', 'page'))[:50].strip()
+            if not page_title:
+                page_title = 'page'
             
+            filename = f"{page_title}_{url_hash}.html"
             html_path = html_dir / filename
+            
+            # Save HTML
             with open(html_path, 'w', encoding='utf-8') as f:
                 f.write(item['raw_html'])
             
-            logger.debug(f"Saved HTML for {item['url']} to {html_path}")
+            # Save metadata alongside HTML
+            meta_filename = f"{page_title}_{url_hash}_meta.json"
+            meta_path = html_dir / meta_filename
+            
+            metadata = {
+                'url': item['url'],
+                'title': item.get('title', ''),
+                'entity_id': item.get('entity_id', ''),
+                'entity_name': item.get('entity_name', ''),
+                'scraped_at': item.get('scraped_at', ''),
+                'has_hamburg_reference': item.get('has_hamburg_reference', False),
+                'has_circular_economy_terms': item.get('has_circular_economy_terms', False),
+                'hamburg_llm': item.get('hamburg_llm', False),
+                'ce_llm': item.get('ce_llm', False),
+                'role_llm': item.get('role_llm', 'Unknown'),
+                'language': item.get('language', ''),
+                'crawl_depth': item.get('crawl_depth', 0),
+                'parent_url': item.get('parent_url', ''),
+                'emails': item.get('emails', []),
+                'phone_numbers': item.get('phone_numbers', [])
+            }
+            
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"Saved HTML and metadata for {item['url']} to {html_dir}")
     
     def _save_text_content(self, item):
-        """Save extracted text content"""
+        """Save extracted text content organized by entity"""
         if item.get('extracted_text'):
-            text_dir = self.export_dir.parent / 'processed' / self.session_id
+            # Organize by entity
+            entity_id = item.get('entity_id', 'unknown').replace('/', '_').replace('.', '_')
+            entity_name = re.sub(r'[^\w\s-]', '', item.get('entity_name', entity_id))[:50]
+            
+            # Create entity-specific directory
+            text_dir = self.export_dir.parent / 'processed' / self.session_id / 'entities' / f"{entity_name}_{entity_id}"
             text_dir.mkdir(parents=True, exist_ok=True)
             
+            # Create descriptive filename
             url_hash = hashlib.md5(item['url'].encode()).hexdigest()[:8]
-            filename = f"{item.get('domain', 'unknown')}_{url_hash}.txt"
+            page_title = re.sub(r'[^\w\s-]', '', item.get('title', 'page'))[:50].strip()
+            if not page_title:
+                page_title = 'page'
             
+            filename = f"{page_title}_{url_hash}.txt"
             text_path = text_dir / filename
+            
+            # Write structured text content
             with open(text_path, 'w', encoding='utf-8') as f:
+                # Header with metadata
+                f.write("=" * 80 + "\n")
                 f.write(f"URL: {item['url']}\n")
                 f.write(f"Title: {item.get('title', 'N/A')}\n")
+                f.write(f"Entity: {item.get('entity_name', 'Unknown')} ({item.get('entity_id', 'unknown')})\n")
                 f.write(f"Organization: {item.get('organization_name', 'N/A')}\n")
                 f.write(f"Location: {item.get('city', 'N/A')}\n")
+                f.write(f"Language: {item.get('language', 'unknown')}\n")
                 f.write(f"Has CE Terms: {item.get('has_circular_economy_terms', False)}\n")
                 f.write(f"Has Hamburg Ref: {item.get('has_hamburg_reference', False)}\n")
-                f.write("-" * 80 + "\n")
+                
+                # LLM classification if available
+                if 'hamburg_llm' in item:
+                    f.write(f"Hamburg (LLM): {item.get('hamburg_llm', False)}\n")
+                if 'ce_llm' in item:
+                    f.write(f"CE (LLM): {item.get('ce_llm', False)}\n")
+                if 'role_llm' in item:
+                    f.write(f"Role (LLM): {item.get('role_llm', 'Unknown')}\n")
+                
+                # Contact info if available
+                if item.get('emails'):
+                    f.write(f"Emails: {', '.join(item['emails'][:3])}\n")  # Limit to 3
+                if item.get('phone_numbers'):
+                    f.write(f"Phones: {', '.join(item['phone_numbers'][:3])}\n")  # Limit to 3
+                
+                f.write("=" * 80 + "\n\n")
+                
+                # Main content
                 f.write(item['extracted_text'])
+                
+            # Also create a summary file per entity
+            summary_path = text_dir / '_entity_summary.json'
+            
+            # Load existing summary or create new
+            if summary_path.exists():
+                with open(summary_path, 'r', encoding='utf-8') as f:
+                    entity_summary = json.load(f)
+            else:
+                entity_summary = {
+                    'entity_id': item.get('entity_id', ''),
+                    'entity_name': item.get('entity_name', ''),
+                    'entity_root_url': item.get('entity_root_url', ''),
+                    'pages_scraped': [],
+                    'total_pages': 0,
+                    'has_hamburg_reference': False,
+                    'has_circular_economy_terms': False,
+                    'hamburg_llm': False,
+                    'ce_llm': False,
+                    'role_llm': 'Unknown',
+                    'all_emails': [],
+                    'all_phones': [],
+                    'languages': []
+                }
+            
+            # Update summary
+            entity_summary['pages_scraped'].append({
+                'url': item['url'],
+                'title': item.get('title', ''),
+                'scraped_at': item.get('scraped_at', '')
+            })
+            entity_summary['total_pages'] += 1
+            entity_summary['has_hamburg_reference'] = entity_summary['has_hamburg_reference'] or item.get('has_hamburg_reference', False)
+            entity_summary['has_circular_economy_terms'] = entity_summary['has_circular_economy_terms'] or item.get('has_circular_economy_terms', False)
+            
+            # Update LLM results if available
+            if 'hamburg_llm' in item:
+                entity_summary['hamburg_llm'] = entity_summary.get('hamburg_llm', False) or item['hamburg_llm']
+            if 'ce_llm' in item:
+                entity_summary['ce_llm'] = entity_summary.get('ce_llm', False) or item['ce_llm']
+            if 'role_llm' in item and item['role_llm'] != 'Unknown':
+                entity_summary['role_llm'] = item['role_llm']
+            
+            # Update unique values using sets for deduplication
+            if item.get('emails'):
+                existing_emails = set(entity_summary.get('all_emails', []))
+                existing_emails.update(item['emails'])
+                entity_summary['all_emails'] = list(existing_emails)
+            if item.get('phone_numbers'):
+                existing_phones = set(entity_summary.get('all_phones', []))
+                existing_phones.update(item['phone_numbers'])
+                entity_summary['all_phones'] = list(existing_phones)
+            if item.get('language'):
+                existing_languages = set(entity_summary.get('languages', []))
+                existing_languages.add(item['language'])
+                entity_summary['languages'] = list(existing_languages)
+            
+            # Save updated summary
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(entity_summary, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"Saved text content for {item['url']} to {text_dir}")
     
     def _flush_buffers(self):
         """Save buffers to files"""
@@ -481,11 +747,13 @@ class LinkExtractionPipeline:
     
     def __init__(self):
         self.extracted_links = set()
+        self.entity_links = {}  # Track which entity found each link
         self.stats = {
             'total_links': 0,
             'internal_links': 0,
             'external_links': 0,
             'potential_entities': 0,
+            'hamburg_ce_entities': 0,
         }
     
     def process_item(self, item, spider):
@@ -493,6 +761,31 @@ class LinkExtractionPipeline:
         
         if not item.get('raw_html'):
             return item
+        
+        # Track entity metadata for link filtering
+        entity_id = item.get('entity_id', 'unknown')
+        is_hamburg = item.get('hamburg_llm', item.get('has_hamburg_reference', False))
+        is_ce = item.get('ce_llm', item.get('has_circular_economy_terms', False))
+        is_relevant = is_hamburg and is_ce
+        
+        # Initialize entity tracking if needed
+        if entity_id not in self.entity_links:
+            self.entity_links[entity_id] = {
+                'links': set(),
+                'is_hamburg': is_hamburg,
+                'is_ce': is_ce,
+                'is_relevant': is_relevant
+            }
+        else:
+            # Update with LLM results if available
+            if 'hamburg_llm' in item:
+                self.entity_links[entity_id]['is_hamburg'] = item['hamburg_llm']
+            if 'ce_llm' in item:
+                self.entity_links[entity_id]['is_ce'] = item['ce_llm']
+            self.entity_links[entity_id]['is_relevant'] = (
+                self.entity_links[entity_id]['is_hamburg'] and 
+                self.entity_links[entity_id]['is_ce']
+            )
         
         soup = BeautifulSoup(item['raw_html'], 'lxml')
         base_url = item['url']
@@ -524,7 +817,11 @@ class LinkExtractionPipeline:
                 # Check if this could be a potential entity
                 if self._is_potential_entity(absolute_url, link.get_text()):
                     self.extracted_links.add(absolute_url)
+                    self.entity_links[entity_id]['links'].add(absolute_url)
                     self.stats['potential_entities'] += 1
+                    
+                    if is_relevant:
+                        self.stats['hamburg_ce_entities'] += 1
         
         item['internal_links'] = list(set(internal_links))[:100]  # Limit to 100
         item['external_links'] = list(set(external_links))[:100]
@@ -561,14 +858,73 @@ class LinkExtractionPipeline:
     
     def close_spider(self, spider):
         """Save extracted links for next crawl iteration"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save ALL discovered links for reference
         if self.extracted_links:
-            links_file = Path('data/exports') / f"discovered_links_{datetime.now():%Y%m%d}.txt"
-            links_file.parent.mkdir(parents=True, exist_ok=True)
+            all_links_file = Path('data/exports') / f"discovered_links_all_{timestamp}.txt"
+            all_links_file.parent.mkdir(parents=True, exist_ok=True)
             
-            with open(links_file, 'w') as f:
+            with open(all_links_file, 'w') as f:
+                f.write(f"# All discovered external links from this crawl\n")
+                f.write(f"# Total: {len(self.extracted_links)} links\n")
+                f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
                 for link in sorted(self.extracted_links):
                     f.write(f"{link}\n")
             
-            logger.info(f"Saved {len(self.extracted_links)} potential entity links to {links_file}")
+            logger.info(f"Saved {len(self.extracted_links)} total discovered links to {all_links_file}")
+        
+        # Save filtered links (only from Hamburg+CE entities) for next iteration
+        relevant_links = set()
+        relevant_entity_count = 0
+        
+        for entity_id, data in self.entity_links.items():
+            if data['is_relevant']:  # Hamburg AND CE
+                relevant_links.update(data['links'])
+                relevant_entity_count += 1
+        
+        if relevant_links:
+            iteration_links_file = Path('data/exports') / f"iteration_seeds_{timestamp}.txt"
+            
+            with open(iteration_links_file, 'w') as f:
+                f.write(f"# Links from Hamburg+CE relevant entities only\n")
+                f.write(f"# For use in next iteration\n")
+                f.write(f"# Total: {len(relevant_links)} links from {relevant_entity_count} relevant entities\n")
+                f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
+                for link in sorted(relevant_links):
+                    f.write(f"{link}\n")
+            
+            logger.info(f"Saved {len(relevant_links)} Hamburg+CE entity links to {iteration_links_file}")
+            
+            # Also create CSV for easier loading
+            iteration_csv = Path('data/exports') / f"iteration_seeds_{timestamp}.csv"
+            with open(iteration_csv, 'w', newline='', encoding='utf-8') as f:
+                import csv
+                writer = csv.DictWriter(f, fieldnames=['website'])
+                writer.writeheader()
+                for link in sorted(relevant_links):
+                    writer.writerow({'website': link})
+            
+            logger.info(f"Also saved iteration seeds as CSV: {iteration_csv}")
+        
+        # Generate link statistics report
+        stats_file = Path('data/exports') / f"link_stats_{timestamp}.json"
+        stats_report = {
+            'timestamp': datetime.now().isoformat(),
+            'total_entities': len(self.entity_links),
+            'hamburg_entities': sum(1 for e in self.entity_links.values() if e['is_hamburg']),
+            'ce_entities': sum(1 for e in self.entity_links.values() if e['is_ce']),
+            'relevant_entities': sum(1 for e in self.entity_links.values() if e['is_relevant']),
+            'all_discovered_links': len(self.extracted_links),
+            'iteration_seed_links': len(relevant_links),
+            'stats': self.stats
+        }
+        
+        with open(stats_file, 'w') as f:
+            json.dump(stats_report, f, indent=2)
         
         logger.info(f"Link extraction stats: {self.stats}")
+        logger.info(f"Entities breakdown - Total: {stats_report['total_entities']}, "
+                   f"Hamburg: {stats_report['hamburg_entities']}, "
+                   f"CE: {stats_report['ce_entities']}, "
+                   f"Both (relevant): {stats_report['relevant_entities']}")

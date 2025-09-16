@@ -57,6 +57,7 @@ DOWNLOADER_MIDDLEWARES = {
 ITEM_PIPELINES = {
     'circular_scraper.pipelines.ValidationPipeline': 100,
     'circular_scraper.pipelines.TextExtractionPipeline': 200,
+    'circular_scraper.pipelines.LLMClassificationPipeline': 250,  # Real-time LLM classification
     'circular_scraper.pipelines.DataStoragePipeline': 300,
     'circular_scraper.pipelines.LinkExtractionPipeline': 400,
 }

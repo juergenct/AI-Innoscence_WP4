@@ -48,7 +48,7 @@ class ScraperRunner:
         """
         logger.info("Starting Static Spider...")
         
-        cmd = ['scrapy', 'crawl', 'static_spider']
+        cmd = [sys.executable, '-m', 'scrapy', 'crawl', 'static_spider']
         
         if seed_file:
             cmd.extend(['-a', f'seed_file={seed_file}'])
@@ -81,7 +81,7 @@ class ScraperRunner:
         logger.info("Starting Dynamic Spider...")
         
         cmd = [
-            'scrapy', 'crawl', 'dynamic_spider',
+            sys.executable, '-m', 'scrapy', 'crawl', 'dynamic_spider',
             '-a', f'start_url={start_url}',
             '-a', f'max_depth={max_depth}'
         ]
@@ -199,9 +199,14 @@ class ScraperRunner:
         logger.info("All dependencies are installed")
         return True
 
-    def _latest_discovered_links(self) -> Path | None:
-        """Return the latest discovered_links_*.txt file path if exists."""
+    def _latest_iteration_seeds(self) -> Path | None:
+        """Return the latest iteration_seeds_*.csv file path if exists."""
         export_dir = self.data_dir / 'exports'
+        # Look for CSV files (easier to load than txt)
+        candidates = sorted(export_dir.glob('iteration_seeds_*.csv'), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+        # Fallback to old discovered_links files for backwards compatibility
         candidates = sorted(export_dir.glob('discovered_links_*.txt'), key=lambda p: p.stat().st_mtime, reverse=True)
         return candidates[0] if candidates else None
 
@@ -260,15 +265,24 @@ class ScraperRunner:
                 logger.warning(f"Could not export aggregated entities table: {e}")
 
             # Prepare next iteration seeds from discovered links
-            latest_links = self._latest_discovered_links()
-            if not latest_links:
-                logger.info("No discovered links found; stopping iterations.")
+            latest_seeds = self._latest_iteration_seeds()
+            if not latest_seeds:
+                logger.info("No iteration seeds found; stopping iterations.")
                 break
+            
+            # Handle CSV or TXT format
             try:
-                with open(latest_links, 'r', encoding='utf-8') as f:
-                    links = [line.strip() for line in f if line.strip()]
+                if latest_seeds.suffix == '.csv':
+                    # Read from CSV
+                    import pandas as pd
+                    df = pd.read_csv(latest_seeds)
+                    links = df['website'].tolist() if 'website' in df else []
+                else:
+                    # Read from TXT (backwards compatibility)
+                    with open(latest_seeds, 'r', encoding='utf-8') as f:
+                        links = [line.strip() for line in f if line.strip() and not line.startswith('#')]
             except Exception as e:
-                logger.warning(f"Failed to read discovered links: {e}")
+                logger.warning(f"Failed to read iteration seeds: {e}")
                 break
 
             next_seeds = self._entity_dedup(links, limit=per_iter_limit)
