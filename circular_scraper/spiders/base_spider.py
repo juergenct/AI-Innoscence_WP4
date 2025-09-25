@@ -60,6 +60,7 @@ class BaseCircularEconomySpider(Spider):
         # URL management
         self.visited_urls = set()
         self.domain_counts = {}  # Track requests per domain
+        self.per_domain_cap_non_hamburg = int(kwargs.get('per_domain_cap_non_hamburg', 300))
         
         # Statistics
         self.stats = {
@@ -181,7 +182,19 @@ class BaseCircularEconomySpider(Spider):
         
         # Track domain
         domain = urlparse(url).netloc
-        self.domain_counts[domain] = self.domain_counts.get(domain, 0) + 1
+        # Enforce per-domain cap for non-Hamburg entities to prevent drift
+        count = self.domain_counts.get(domain, 0) + 1
+        self.domain_counts[domain] = count
+        # If domain is already over cap and not known Hamburg, drop the request early
+        # Resolve entity by domain root
+        try:
+            target_entity = self.entity_resolver.resolve(url)
+            is_hamburg_entity = self.entity_relevance.get(target_entity.entity_id, None)
+        except Exception:
+            is_hamburg_entity = None
+        if is_hamburg_entity is False and count > self.per_domain_cap_non_hamburg:
+            logger.debug(f"Skipping request due to per-domain cap (non-HH): {domain} count={count}")
+            return Request(url=url, callback=lambda r: None)  # no-op to satisfy type, effectively skipped
         
         self.stats['total_requests'] += 1
         
@@ -292,6 +305,9 @@ class BaseCircularEconomySpider(Spider):
             # First time seeing this entity - check Hamburg relevance
             is_hamburg = self._quick_hamburg_check(response)
             self.entity_relevance[resolved.entity_id] = is_hamburg
+            if is_hamburg:
+                # Increment Hamburg entity counter once per entity
+                self.stats['hamburg_entities'] += 1
             
             if not is_hamburg:
                 logger.info(f"Entity {resolved.entity_id} is NOT Hamburg-related. Stopping crawl for this entity.")
@@ -316,7 +332,15 @@ class BaseCircularEconomySpider(Spider):
         self.stats['items_scraped'] += 1
         
         # Check if this entity should be crawled comprehensively
-        is_ce = self.entity_ce_relevance.get(resolved.entity_id, item.get('ce_llm', item.get('has_circular_economy_terms', False)))
+        is_ce = self.entity_ce_relevance.get(
+            resolved.entity_id,
+            item.get('ce_llm', item.get('has_circular_economy_terms', False))
+        )
+        if is_ce and resolved.entity_id not in getattr(self, '_counted_ce_entities', set()):
+            # Count CE entity once
+            self._counted_ce_entities = getattr(self, '_counted_ce_entities', set())
+            self._counted_ce_entities.add(resolved.entity_id)
+            self.stats['ce_entities'] += 1
         
         if self.comprehensive_crawl and is_hamburg and is_ce:
             # Mark for comprehensive crawling
@@ -375,6 +399,22 @@ class BaseCircularEconomySpider(Spider):
             
             # Check domain
             link_domain = urlparse(absolute_url).netloc
+
+            # Global skip rules for noisy domains/subdomains
+            skip_prefixes = (
+                'intranet.', 'extranet.', 'collaborating.', 'cloud.', 'login.',
+                'account.', 'nextcloud.', 'studip.', 'katalog.', 'events.'
+            )
+            if link_domain.lower().startswith(skip_prefixes):
+                continue
+
+            # Skip path patterns unless depth==0 (allow at depth 0 for classification)
+            path_lower = (urlparse(absolute_url).path or '').lower()
+            skip_path_fragments = (
+                '/login', '/wp-admin', '/account', '/apps/forms', '/impressum', '/datenschutz'
+            )
+            if any(frag in path_lower for frag in skip_path_fragments) and current_depth > 0:
+                continue
             
             # Get entity relevance
             source_entity = self.entity_resolver.resolve(response.url)
@@ -402,10 +442,10 @@ class BaseCircularEconomySpider(Spider):
                     ])
                     should_follow = (current_depth == 0) or is_candidate
             elif self.follow_external:
-                # Only follow external links from Hamburg entities
-                # AND they should look relevant
-                # But respect depth limits unless comprehensive
-                if source_is_hamburg and current_depth < self.max_depth:
+                # Only follow external links from Hamburg entities that are CE-relevant
+                # Respect depth limits unless comprehensive
+                source_is_ce = self.entity_ce_relevance.get(source_entity.entity_id, False)
+                if source_is_hamburg and source_is_ce and current_depth < self.max_depth:
                     should_follow = self._is_relevant_external_link(absolute_url, link_domain)
                 else:
                     should_follow = False

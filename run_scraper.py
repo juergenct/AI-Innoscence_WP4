@@ -296,7 +296,7 @@ class ScraperRunner:
         logger.info("Iterative crawl finished")
         return True
 
-    def classify_entities_with_llm(self, sample_per_entity: int = 3, model: str = 'qwen3-4b-instruct', max_entities: int | None = None, debug_dir: str | None = None):
+    def classify_entities_with_llm(self, sample_per_entity: int = 3, model: str = 'qwen3:4b', max_entities: int | None = None, debug_dir: str | None = None):
         """Classify entities via Ollama LLM and write annotated aggregated CSV."""
         from circular_scraper.utils.export_manager import ExportManager
         from circular_scraper.utils.llm_classifier import LLMClassifier
@@ -408,8 +408,8 @@ Examples:
                        help='Classify entities via local LLM (Ollama)')
     parser.add_argument('--llm-samples', type=int, default=3,
                        help='Samples per entity for LLM classification (default: 3)')
-    parser.add_argument('--llm-model', type=str, default='qwen3-4b-instruct',
-                       help='Ollama model name (default: qwen3-4b-instruct)')
+    parser.add_argument('--llm-model', type=str, default='qwen3:4b',
+                       help='Ollama model name (default: qwen3:4b)')
     parser.add_argument('--llm-max-entities', type=int, default=0,
                        help='Limit number of entities to classify (0=all)')
     parser.add_argument('--llm-debug-dir', type=str, default=None,

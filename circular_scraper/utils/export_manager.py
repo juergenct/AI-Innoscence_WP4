@@ -435,10 +435,13 @@ class ExportManager:
         report.append("")
         
         if self.entities_df is not None and not self.entities_df.empty:
-            report.append("ENTITIES SCRAPED")
+            report.append("PAGES SCRAPED")
             report.append("-" * 40)
-            report.append(f"Total entities: {len(self.entities_df)}")
+            report.append(f"Total pages: {len(self.entities_df)}")
             report.append(f"Unique domains: {self.entities_df['domain'].nunique()}")
+            # Approximate unique entities by entity_id if present
+            if 'entity_id' in self.entities_df.columns:
+                report.append(f"Unique entities: {self.entities_df['entity_id'].nunique()}")
             
             if 'has_circular_economy_terms' in self.entities_df:
                 ce_count = self.entities_df['has_circular_economy_terms'].sum()

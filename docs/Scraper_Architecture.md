@@ -26,10 +26,11 @@ The Circular Economy Hamburg Web Scraper is a sophisticated Scrapy-based system 
 ### Key Features
 - **Dual-mode crawling**: Static HTML and dynamic JavaScript rendering
 - **Entity resolution**: Smart grouping of multi-page organizations
-- **Hamburg-focused**: Multi-strategy Hamburg relevance detection
-- **CE detection**: Comprehensive circular economy keyword matching
-- **LLM classification**: 14 ecosystem roles via local Ollama models
-- **Iterative discovery**: Multi-round crawling with intelligent link filtering
+- **Hamburg-focused**: Enhanced 6-strategy detection with strong gating (non-Hamburg entities stop immediately)
+- **CE detection**: LLM-first CE detection during crawl (keyword fallback)
+- **LLM classification (real-time)**: 14 ecosystem roles via local Ollama models; batched during crawl
+- **Comprehensive crawl**: Hamburg+CE entities crawled without depth limit for internal links
+- **Iterative discovery**: Multi-round crawling with intelligent link filtering (LLM-preferred relevance)
 - **Entity-organized storage**: Hierarchical data organization by entity
 
 ### Technology Stack
@@ -37,7 +38,7 @@ The Circular Economy Hamburg Web Scraper is a sophisticated Scrapy-based system 
 - **JavaScript rendering**: Playwright via scrapy-playwright
 - **Text extraction**: trafilatura, BeautifulSoup4
 - **Data processing**: pandas, pyarrow
-- **LLM**: Ollama with Qwen/Qwen3-4B-Instruct-2507
+- **LLM**: Ollama with Qwen/qwen3:4b-2507
 - **Storage**: CSV, Parquet, JSON, HTML, TXT
 
 ---
@@ -120,30 +121,33 @@ The Circular Economy Hamburg Web Scraper is a sophisticated Scrapy-based system 
    - Contact extraction (emails, phones, social media)
    - CE keyword detection (recycling, sustainability, etc.)
 
-6. **Data Storage Phase** (Entity-organized)
+6. **LLM Classification Phase (Real-time, Batched)**
+   - LLM pipeline buffers entity contexts and classifies in batches (size 100, flush every 30s or on close)
+   - Produces `hamburg_llm`, `ce_llm`, `role_llm`, `classification_confidence`
+   - Results gate crawling (mark entities for comprehensive crawl) and influence link filtering
+   - Keywords retained as fallback when LLM is unavailable
+
+7. **Data Storage Phase** (Entity-organized)
    - Raw HTML with metadata JSON
    - Processed text with headers
    - Entity summary aggregation
    - Buffered writes to CSV/Parquet/JSON
 
-7. **Link Discovery Phase**
+8. **Link Discovery Phase**
    - Extract all internal and external links
    - Track which entity discovered each link
    - Identify potential new entities
    - Save ALL links for reference
 
-8. **Filtering Phase** (Hamburg+CE)
+9. **Filtering Phase** (Hamburg+CE)
    - Filter links to only those from relevant entities
    - Create iteration seeds CSV for next round
    - Generate statistics report
 
-9. **LLM Classification Phase**
-   - Sample pages per entity (default 3)
-   - Classify Hamburg relevance, CE relevance, ecosystem role
-   - 14 specific roles with definitions
-   - Merge results into aggregated data
+10. **Optional Offline LLM Merge**
+    - Post-run consolidation step (optional): merge LLM classification into aggregated CSV via `run_scraper.py --classify`
 
-10. **Iteration Loop**
+11. **Iteration Loop**
     - Use filtered seeds for next crawl
     - Entity deduplication (one root URL per entity)
     - Repeat for N iterations (default 4-5)
@@ -220,9 +224,13 @@ Primary data container for scraped pages.
 - `social_media`: Social media profiles
 
 **Classification Fields:**
-- `has_circular_economy_terms`: CE relevance
-- `has_hamburg_reference`: Hamburg relevance
+- `has_circular_economy_terms`: CE relevance (keyword fallback)
+- `has_hamburg_reference`: Hamburg relevance (spider detection)
 - `keywords`: Found CE keywords
+- `hamburg_llm`: LLM Hamburg boolean (if available)
+- `ce_llm`: LLM CE boolean (if available)
+- `role_llm`: One of 14 roles (if available)
+- `classification_confidence`: 0–1 (if available)
 
 ---
 
@@ -234,14 +242,20 @@ Abstract base class providing common functionality.
 **Key Features:**
 - URL loading from CSV or command line
 - Entity resolution and relevance tracking
-- Hamburg detection (enhanced 6-strategy approach)
-- Depth-limited crawling
+- Hamburg detection (enhanced 6-strategy approach) with strong gating
+- Depth-limited crawling (with comprehensive override for Hamburg+CE)
 - Statistics collection
 
+**Global Skip Rules (noise reduction):**
+- Skip subdomains: `intranet.`, `extranet.`, `collaborating.`, `cloud.`, `login.`, `account.`, `nextcloud.`, `studip.`, `katalog.`, `events.`
+- Skip paths (unless depth==0 for initial classification): `/login`, `/wp-admin`, `/account`, `/apps/forms`, `/impressum`, `/datenschutz`
+
 **Entity Relevance Gating:**
-- Initial discovery at depth 0: crawl all
-- Depth > 0: only follow if entity is Hamburg-relevant
-- Candidate pages (contact/about) always checked
+- First page of a new entity runs Hamburg detection
+- If non-Hamburg: stop crawling this entity immediately; do not follow links
+- If Hamburg: continue; if LLM determines CE=true, mark entity for comprehensive crawl
+- Comprehensive crawl: internal links are followed without depth limit; external links still respect depth limits
+- Candidate pages (contact/about) may be used at depth 0 to help classify
 
 ### StaticSpider
 For standard HTML websites.
@@ -284,17 +298,24 @@ Optional per-domain depth limits to prevent infinite crawls.
 - Contact extraction
 - Keyword detection
 
-### 3. DataStoragePipeline (Priority: 300)
+### 3. LLMClassificationPipeline (Priority: 250)
+- Batched real-time classification (default batch size: 100; flush every 30s)
+- Outputs: `hamburg_llm`, `ce_llm`, `role_llm`, `classification_confidence`
+- Updates spider gates and comprehensive crawling set
+- Caches results to avoid re-classification
+
+### 4. DataStoragePipeline (Priority: 300)
 - Entity-organized storage
 - Buffered writes
 - Multiple formats (CSV, Parquet, JSON)
 - Entity summary aggregation
 
-### 4. LinkExtractionPipeline (Priority: 400)
+### 5. LinkExtractionPipeline (Priority: 400)
 - Extract all links
 - Track source entity
-- Dual output: ALL links + Filtered seeds
+- Dual output: ALL links + Filtered seeds (LLM-preferred Hamburg+CE)
 - Statistics generation
+ - Domain/path skip rules aligned with spider to avoid portals/login/forms in iteration seeds
 
 ---
 
@@ -305,6 +326,15 @@ Groups pages into logical entities.
 - Default: Group by domain
 - Academic: Group by first path segment
 - Multi-entity domain support
+
+### Name-to-Domain Resolver
+Resolves company names to official websites to create high-quality seed lists.
+- Input: CSV with `name` (required if `website` missing) and optional `website`/`url` column
+- If `website` is provided, websearch is skipped; URL is validated and used
+- Otherwise, performs websearch + verification (Impressum/Kontakt, Hamburg signals, .de TLD)
+- Outputs:
+  - `data/iter_seeds/seeds_from_names.csv` (website)
+  - `data/iter_seeds/name_to_domain_mapping.csv` (name→domain mapping with confidence)
 
 ### ExportManager
 Data consolidation and export.
@@ -331,7 +361,7 @@ URL normalization and tracking.
 ### Workflow
 1. Initial crawl with seeds
 2. Discover all links
-3. Filter Hamburg+CE relevant
+3. Filter Hamburg+CE relevant (LLM-preferred when available)
 4. Entity deduplication
 5. Next iteration with filtered seeds
 
@@ -361,12 +391,12 @@ URL normalization and tracking.
 13. Funding Bodies
 14. Knowledge and Innovation Communities
 
-### Classification Process
-1. Group by entity_id
-2. Sample pages (default 3)
-3. Query Ollama
-4. Parse JSON response
-5. Merge results
+### Real-time Batched Classification
+1. During crawl, the LLM pipeline collects 1–3 sample pages per entity
+2. Entities are queued once they meet the minimum samples (default 1)
+3. A batch is flushed when 100 entities are queued, 30 seconds have elapsed, or the spider closes
+4. Classification runs in a small thread pool; results are cached and applied to subsequent items
+5. Results gate crawling (mark CE entities for comprehensive crawl) and are used for iteration seed filtering (preferred over keyword flags)
 
 ---
 
@@ -399,13 +429,17 @@ DOWNLOAD_DELAY = 2
 DEPTH_LIMIT = 3
 DOWNLOAD_TIMEOUT = 30
 MEMUSAGE_LIMIT_MB = 2048
+# LLM batching
+LLM_CLASSIFY_BATCH_SIZE = 100
+LLM_MIN_SAMPLES_PER_ENTITY = 1
+LLM_CLASSIFY_FLUSH_INTERVAL_SECS = 30
 ```
 
 ### Setup
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-ollama pull qwen3-4b-instruct
+ollama pull qwen3:4b
 ```
 
 ---
@@ -425,6 +459,9 @@ python run_scraper.py --seed initial.csv --iterate 5
 
 # With classification
 python run_scraper.py --seed initial.csv --classify
+
+# Cleanup legacy/unused data (keep last 2 sessions and generations)
+python -m circular_scraper.utils.cleanup_manager --data-dir data --keep-sessions 2 --keep-generations 2
 ```
 
 ### Command Line Arguments

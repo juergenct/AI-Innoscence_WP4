@@ -15,6 +15,9 @@ from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse, urljoin
 
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import requests
 from bs4 import BeautifulSoup
 import trafilatura
 from scrapy.exceptions import DropItem
@@ -327,6 +330,8 @@ class LLMClassificationPipeline:
     def __init__(self):
         self.classification_cache = {}
         self.entity_samples = {}  # Collect samples per entity
+        self._batch_map = {}
+        self._last_flush_ts = time.time()
         self.stats = {
             'entities_classified': 0,
             'hamburg_relevant': 0,
@@ -337,17 +342,34 @@ class LLMClassificationPipeline:
         # Initialize LLM classifier (lazy loading)
         self.classifier = None
         self.enabled = False
+        self.batch_size = 100
+        self.min_samples = 1
+        self.flush_interval_secs = 30
+        self.translate_to_en = True
+        self.translate_max_chars = 1000
+        self.translate_model = None
         
     def open_spider(self, spider):
         """Initialize LLM classifier when spider opens"""
         try:
             from circular_scraper.utils.llm_classifier import LLMClassifier
-            self.classifier = LLMClassifier()
+            # Ensure debug directory exists and is set
+            debug_dir = Path('data/exports') / 'llm_debug'
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            self.classifier = LLMClassifier(debug_dir=str(debug_dir))
             if self.classifier.check_server():
                 self.enabled = True
                 logger.info("LLM Classification Pipeline enabled")
             else:
                 logger.warning("LLM server not available. Classification disabled.")
+            # Settings (robust retrieval)
+            s = spider.crawler.settings
+            self.batch_size = int(s.get('LLM_CLASSIFY_BATCH_SIZE', 100))
+            self.min_samples = int(s.get('LLM_MIN_SAMPLES_PER_ENTITY', 1))
+            self.flush_interval_secs = int(s.get('LLM_CLASSIFY_FLUSH_INTERVAL_SECS', 30))
+            self.translate_to_en = bool(s.get('LLM_TRANSLATE_TO_EN', True))
+            self.translate_max_chars = int(s.get('LLM_TRANSLATE_MAX_CHARS', 1000))
+            self.translate_model = s.get('LLM_TRANSLATE_MODEL', None)
         except ImportError:
             logger.warning("LLM classifier not available. Skipping LLM classification.")
         except Exception as e:
@@ -363,7 +385,7 @@ class LLMClassificationPipeline:
         if not entity_id:
             return item
         
-        # Collect samples for this entity (max 3)
+        # Collect samples for this entity (cap at 3)
         if entity_id not in self.entity_samples:
             self.entity_samples[entity_id] = []
         
@@ -372,7 +394,8 @@ class LLMClassificationPipeline:
                 'url': item.get('url'),
                 'title': item.get('title'),
                 'meta_description': item.get('meta_description'),
-                'extracted_text': item.get('extracted_text', '')[:1000]  # First 1000 chars
+                'extracted_text': item.get('extracted_text', '')[:1000],  # First 1000 chars
+                'language': item.get('language')
             }
             self.entity_samples[entity_id].append(sample)
         
@@ -385,62 +408,107 @@ class LLMClassificationPipeline:
             item['classification_confidence'] = result.get('confidence', 0.0)
             return item
         
-        # Classify after collecting enough samples (or on the 3rd page)
-        if len(self.entity_samples[entity_id]) >= 3 or item.get('crawl_depth', 0) >= 2:
-            try:
-                # Prepare context for LLM
-                context = {
-                    'entity_id': entity_id,
-                    'entity_name': item.get('entity_name'),
-                    'entity_root_url': item.get('entity_root_url'),
-                    'domain': item.get('domain'),
-                    'samples': self.entity_samples[entity_id]
-                }
-                
-                # Classify with LLM
-                result = self.classifier.classify_entity(context)
-                
-                # Cache result
-                self.classification_cache[entity_id] = {
-                    'hamburg_related': result.hamburg_related,
-                    'ce_related': result.ce_related,
-                    'role': result.role,
-                    'confidence': result.confidence
-                }
-                
-                # Update spider's entity relevance based on LLM
-                if hasattr(spider, 'entity_ce_relevance'):
-                    spider.entity_ce_relevance[entity_id] = result.ce_related
-                
-                # Add to item
-                item['hamburg_llm'] = result.hamburg_related
-                item['ce_llm'] = result.ce_related
-                item['role_llm'] = result.role
-                item['classification_confidence'] = result.confidence
-                
-                # Update stats
-                self.stats['entities_classified'] += 1
-                if result.hamburg_related:
-                    self.stats['hamburg_relevant'] += 1
-                if result.ce_related:
-                    self.stats['ce_relevant'] += 1
-                if result.hamburg_related and result.ce_related:
-                    self.stats['both_relevant'] += 1
-                
-                logger.info(f"LLM classified {entity_id}: Hamburg={result.hamburg_related}, "
-                          f"CE={result.ce_related}, Role={result.role}")
-                
-            except Exception as e:
-                logger.error(f"LLM classification failed for {entity_id}: {e}")
-                item['hamburg_llm'] = item.get('has_hamburg_reference', False)
-                item['ce_llm'] = item.get('has_circular_economy_terms', False)
-                item['role_llm'] = 'Unknown'
-                item['classification_confidence'] = 0.0
+        # Enqueue for batched classification when we have enough samples
+        if len(self.entity_samples[entity_id]) >= self.min_samples and entity_id not in self._batch_map:
+            ctx = {
+                'entity_id': entity_id,
+                'entity_name': item.get('entity_name'),
+                'entity_root_url': item.get('entity_root_url'),
+                'domain': item.get('domain'),
+                'samples': self.entity_samples[entity_id]
+            }
+            self._batch_map[entity_id] = ctx
+
+        # Flush batch when size/interval exceeded
+        now = time.time()
+        if len(self._batch_map) >= self.batch_size or (now - self._last_flush_ts) >= self.flush_interval_secs:
+            self._flush_batch(spider)
         
         return item
     
+    def _flush_batch(self, spider):
+        if not self._batch_map:
+            return
+        contexts = list(self._batch_map.values())
+        self._batch_map.clear()
+        self._last_flush_ts = time.time()
+        try:
+            # Optional translation step to English
+            if self.translate_to_en and self.classifier:
+                base = self.classifier.base
+                model = self.translate_model or self.classifier.model
+                for ctx in contexts:
+                    for s in ctx.get('samples', []):
+                        lang = (s.get('language') or '').strip().lower()
+                        if lang and lang != 'en':
+                            text = (s.get('extracted_text') or '')[: self.translate_max_chars]
+                            if not text:
+                                continue
+                            try:
+                                payload = {
+                                    "model": model,
+                                    "messages": [
+                                        {"role": "system", "content": "You are a translator. Translate the user's text to English. Return only the translated plain text (no comments, no code fences)."},
+                                        {"role": "user", "content": text}
+                                    ],
+                                    "stream": False,
+                                }
+                                resp = requests.post(f"{base}/api/chat", json=payload, timeout=(self.classifier.connect_timeout, self.classifier.timeout))
+                                resp.raise_for_status()
+                                data = resp.json()
+                                content = (data.get("message", {}) or {}).get("content", "").strip()
+                                if content:
+                                    s['extracted_text'] = content[: self.translate_max_chars]
+                                    s['language'] = 'en'
+                            except Exception as e:
+                                logger.warning(f"Translation failed; using original text. err={e}")
+
+            # Parallel classification using the classifier's worker count
+            with ThreadPoolExecutor(max_workers=self.classifier.max_workers if self.classifier else 2) as ex:
+                future_to_ctx = {ex.submit(self.classifier.classify_entity, ctx): ctx for ctx in contexts}
+                for future in as_completed(future_to_ctx):
+                    ctx = future_to_ctx[future]
+                    entity_id = ctx.get('entity_id')
+                    try:
+                        result = future.result(timeout=self.classifier.timeout + self.classifier.connect_timeout + 5 if self.classifier else 40)
+                        # Cache result
+                        self.classification_cache[entity_id] = {
+                            'hamburg_related': result.hamburg_related,
+                            'ce_related': result.ce_related,
+                            'role': result.role,
+                            'confidence': result.confidence
+                        }
+                        # Update spider gates immediately for runtime decisions
+                        if hasattr(spider, 'entity_ce_relevance'):
+                            spider.entity_ce_relevance[entity_id] = result.ce_related
+                        # If entity becomes Hamburg+CE, mark comprehensive
+                        if hasattr(spider, 'entity_relevance') and hasattr(spider, 'comprehensive_entities'):
+                            is_hh = bool(spider.entity_relevance.get(entity_id, False) or result.hamburg_related)
+                            if is_hh and result.ce_related:
+                                if entity_id not in spider.comprehensive_entities:
+                                    spider.comprehensive_entities.add(entity_id)
+                                    spider.stats['comprehensive_entities'] = spider.stats.get('comprehensive_entities', 0) + 1
+                        # Stats
+                        self.stats['entities_classified'] += 1
+                        if result.hamburg_related:
+                            self.stats['hamburg_relevant'] += 1
+                        if result.ce_related:
+                            self.stats['ce_relevant'] += 1
+                        if result.hamburg_related and result.ce_related:
+                            self.stats['both_relevant'] += 1
+                        logger.info(f"LLM classified {entity_id}: Hamburg={result.hamburg_related}, CE={result.ce_related}, Role={result.role}")
+                    except Exception as e:
+                        logger.error(f"LLM batch classification failed for {entity_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to flush LLM batch: {e}")
+
     def close_spider(self, spider):
         """Log statistics when spider closes"""
+        # Final flush
+        try:
+            self._flush_batch(spider)
+        except Exception as e:
+            logger.error(f"Final LLM batch flush failed: {e}")
         logger.info(f"LLM classification stats: {self.stats}")
         
         # Save classification results to file
@@ -747,6 +815,7 @@ class LinkExtractionPipeline:
     
     def __init__(self):
         self.extracted_links = set()
+        self.all_links = set()
         self.entity_links = {}  # Track which entity found each link
         self.stats = {
             'total_links': 0,
@@ -755,6 +824,14 @@ class LinkExtractionPipeline:
             'potential_entities': 0,
             'hamburg_ce_entities': 0,
         }
+        # Skip rules aligned with spider
+        self.skip_prefixes = (
+            'intranet.', 'extranet.', 'collaborating.', 'cloud.', 'login.',
+            'account.', 'nextcloud.', 'studip.', 'katalog.', 'events.'
+        )
+        self.skip_path_fragments = (
+            '/login', '/wp-admin', '/account', '/apps/forms', '/impressum', '/datenschutz'
+        )
     
     def process_item(self, item, spider):
         """Extract and categorize links"""
@@ -807,6 +884,19 @@ class LinkExtractionPipeline:
             # Categorize link
             link_domain = urlparse(absolute_url).netloc
             
+            # Apply domain skip rules for iteration hygiene
+            if link_domain.lower().startswith(self.skip_prefixes):
+                continue
+
+            # Apply path skip rules
+            path_lower = (urlparse(absolute_url).path or '').lower()
+            if any(frag in path_lower for frag in self.skip_path_fragments):
+                # Allow only at depth 0 for classification pages; here we don't have depth, so skip for seeds
+                continue
+
+            # Track ALL discovered absolute links (internal + external)
+            self.all_links.add(absolute_url)
+
             if link_domain == base_domain:
                 internal_links.append(absolute_url)
                 self.stats['internal_links'] += 1
@@ -844,6 +934,18 @@ class LinkExtractionPipeline:
         domain = urlparse(url).netloc
         if any(skip in domain for skip in skip_domains):
             return False
+        # Skip noisy subdomains/prefixes
+        if domain.lower().startswith((
+            'intranet.', 'extranet.', 'collaborating.', 'cloud.', 'login.',
+            'account.', 'nextcloud.', 'studip.', 'katalog.', 'events.'
+        )):
+            return False
+        # Skip noisy paths
+        path_lower = (urlparse(url).path or '').lower()
+        if any(frag in path_lower for frag in (
+            '/login', '/wp-admin', '/account', '/apps/forms'
+        )):
+            return False
         
         # Look for Hamburg or German domains
         if '.de' in domain or 'hamburg' in domain.lower():
@@ -861,25 +963,35 @@ class LinkExtractionPipeline:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         # Save ALL discovered links for reference
-        if self.extracted_links:
+        if self.all_links:
             all_links_file = Path('data/exports') / f"discovered_links_all_{timestamp}.txt"
             all_links_file.parent.mkdir(parents=True, exist_ok=True)
             
             with open(all_links_file, 'w') as f:
-                f.write(f"# All discovered external links from this crawl\n")
-                f.write(f"# Total: {len(self.extracted_links)} links\n")
+                f.write(f"# All discovered links from this crawl (internal + external)\n")
+                f.write(f"# Total: {len(self.all_links)} links\n")
                 f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
-                for link in sorted(self.extracted_links):
+                for link in sorted(self.all_links):
                     f.write(f"{link}\n")
             
-            logger.info(f"Saved {len(self.extracted_links)} total discovered links to {all_links_file}")
+            logger.info(f"Saved {len(self.all_links)} total discovered links to {all_links_file}")
         
         # Save filtered links (only from Hamburg+CE entities) for next iteration
         relevant_links = set()
         relevant_entity_count = 0
         
         for entity_id, data in self.entity_links.items():
-            if data['is_relevant']:  # Hamburg AND CE
+            # Re-evaluate relevance using spider-wide decisions if available
+            hh = data.get('is_hamburg', False)
+            ce = data.get('is_ce', False)
+            try:
+                if hasattr(spider, 'entity_relevance'):
+                    hh = bool(spider.entity_relevance.get(entity_id, hh))
+                if hasattr(spider, 'entity_ce_relevance'):
+                    ce = bool(spider.entity_ce_relevance.get(entity_id, ce))
+            except Exception:
+                pass
+            if hh and ce:  # Hamburg AND CE
                 relevant_links.update(data['links'])
                 relevant_entity_count += 1
         
@@ -915,7 +1027,7 @@ class LinkExtractionPipeline:
             'hamburg_entities': sum(1 for e in self.entity_links.values() if e['is_hamburg']),
             'ce_entities': sum(1 for e in self.entity_links.values() if e['is_ce']),
             'relevant_entities': sum(1 for e in self.entity_links.values() if e['is_relevant']),
-            'all_discovered_links': len(self.extracted_links),
+            'all_discovered_links': len(self.all_links),
             'iteration_seed_links': len(relevant_links),
             'stats': self.stats
         }

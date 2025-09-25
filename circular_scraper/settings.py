@@ -19,8 +19,8 @@ TWISTED_REACTOR = 'twisted.internet.asyncioreactor.AsyncioSelectorReactor'
 ROBOTSTXT_OBEY = True
 
 # Configure maximum concurrent requests
-CONCURRENT_REQUESTS = 8  # Total concurrent requests
-CONCURRENT_REQUESTS_PER_DOMAIN = 2  # Max 2 requests per domain simultaneously
+CONCURRENT_REQUESTS = 16  # Total concurrent requests
+CONCURRENT_REQUESTS_PER_DOMAIN = 4  # Max 4 requests per domain simultaneously
 
 # Configure delays (in seconds)
 DOWNLOAD_DELAY = 2  # Base delay between requests (will be randomized 0.5 * to 1.5 * DOWNLOAD_DELAY)
@@ -29,7 +29,7 @@ RANDOMIZE_DOWNLOAD_DELAY = True
 # AutoThrottle for automatic adjustment of delays
 AUTOTHROTTLE_ENABLED = True
 AUTOTHROTTLE_START_DELAY = 1
-AUTOTHROTTLE_MAX_DELAY = 10
+AUTOTHROTTLE_MAX_DELAY = 15
 AUTOTHROTTLE_TARGET_CONCURRENCY = 4.0
 AUTOTHROTTLE_DEBUG = True  # Enable to see throttling stats
 
@@ -88,8 +88,8 @@ RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
 # Memory and performance settings
 REACTOR_THREADPOOL_MAXSIZE = 20
 MEMUSAGE_ENABLED = True
-MEMUSAGE_LIMIT_MB = 2048  # Stop if using more than 2GB RAM
-MEMUSAGE_WARNING_MB = 1536  # Warning at 1.5GB
+MEMUSAGE_LIMIT_MB = 4096  # Stop if using more than 4GB RAM
+MEMUSAGE_WARNING_MB = 3584  # Warning at 3.5GB
 
 # Logging
 LOG_LEVEL = 'INFO'
@@ -112,6 +112,15 @@ EXPORT_DIR = DATA_DIR / 'exports'
 for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, EXPORT_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
+# LLM classification batching
+LLM_CLASSIFY_BATCH_SIZE = 100
+LLM_MIN_SAMPLES_PER_ENTITY = 1
+LLM_CLASSIFY_FLUSH_INTERVAL_SECS = 10
+LLM_TRANSLATE_TO_EN = True
+LLM_TRANSLATE_MAX_CHARS = 1000
+# Optional: override translation model (defaults to LLM classifier model)
+LLM_TRANSLATE_MODEL = None
+
 # Duplicate filtering
 DUPEFILTER_CLASS = 'scrapy.dupefilters.RFPDupeFilter'
 DUPEFILTER_DEBUG = True
@@ -132,5 +141,5 @@ EXTENSIONS = {
 }
 
 # Close spider after certain conditions
-CLOSESPIDER_PAGECOUNT = 10000  # Stop after 10,000 pages
-CLOSESPIDER_TIMEOUT = 14400  # Stop after 4 hours
+CLOSESPIDER_PAGECOUNT = 100000  # Stop after 100,000 pages
+CLOSESPIDER_TIMEOUT = 43200  # Stop after 12 hours

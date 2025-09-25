@@ -7,8 +7,8 @@ Provides a unified classifier for:
 - Circular Economy (CE) relevance
 - CE ecosystem role
 
-Model: default 'qwen3-4b-instruct' (created in Ollama from
-Hugging Face model 'Qwen/Qwen3-4B-Instruct-2507').
+Model: default 'qwen3:4b' (created in Ollama from
+Hugging Face model 'Qwen/qwen3:4b-2507').
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ class LLMResult:
 class LLMClassifier:
     def __init__(self,
                  server_url: str = 'http://localhost:11434',
-                 model: str = 'qwen3-4b-instruct',
+                 model: str = 'qwen3:4b',
                  timeout: int = 30,
                  connect_timeout: int = 5,
                  max_workers: int = 2,
@@ -60,7 +60,17 @@ class LLMClassifier:
             resp.raise_for_status()
             models = [m.get('name') for m in resp.json().get('models', [])]
             if self.model not in models:
-                logger.warning(f"Model '{self.model}' not listed by Ollama; available: {models}")
+                # Try to auto-select a compatible Qwen model
+                preferred = None
+                for cand in ('qwen3:4b', 'qwen3:8b'):
+                    if cand in models:
+                        preferred = cand
+                        break
+                if preferred:
+                    logger.warning(f"Model '{self.model}' not listed by Ollama; switching to '{preferred}'. Available: {models}")
+                    self.model = preferred
+                else:
+                    logger.warning(f"Model '{self.model}' not listed by Ollama; available: {models}")
             return True
         except Exception as e:
             logger.error(f"Cannot reach Ollama at {self.base}: {e}")
@@ -78,9 +88,9 @@ class LLMClassifier:
             "hamburg_related (bool), ce_related (bool), role (string), confidence (0-1). "
             "Hamburg-related means the organization or page is connected to Hamburg (Germany) via address, activities, or explicit mentions. "
             "Circular Economy (CE) relevance includes recycling, resource efficiency, waste management, reuse, bioeconomy, sustainability, etc. "
-            "\nRole MUST be exactly one of these categories based on the entity's primary function:\n"
+            "\nChoose the role from this CLOSED SET of 14 categories based on the entity's primary function:\n"
             "- Students: Student organizations, student initiatives, student councils\n"
-            "- Researchers: Individual researchers, research groups, research departments\n" 
+            "- Researchers: Individual researchers, research groups, research departments\n"
             "- Higher Education Institutions: Universities, colleges, academies\n"
             "- Research Institutes: Dedicated research centers, institutes, laboratories\n"
             "- Non-Governmental Organizations: NGOs, non-profits, associations, foundations\n"
@@ -90,11 +100,10 @@ class LLMClassifier:
             "- Policy Makers: Legislative bodies, policy institutes, advisory councils\n"
             "- End-Users: Consumer groups, user communities, citizen platforms\n"
             "- Citizen Associations: Community groups, neighborhood initiatives, civic organizations\n"
-            "- Media and Communication Partners: News outlets, PR agencies, communication platforms\n"
+            "- Media and Communication Partners: News outlets, PR/communications agencies, media platforms\n"
             "- Funding Bodies: Grant organizations, investment funds, financial institutions\n"
             "- Knowledge and Innovation Communities: Innovation hubs, knowledge platforms, networks\n"
-            "- Unknown: Use only if the entity doesn't fit any category above\n"
-            "Select the single most appropriate role. Output JSON only, no additional text."
+            "If none fit, set role to 'Unknown'. Output JSON only, no additional text."
         )
         user = {
             "entity": {
@@ -121,11 +130,18 @@ class LLMClassifier:
             {"role": "user", "content": user_text},
         ]
 
-    def _call_ollama(self, messages: List[Dict[str, str]], entity_id: Optional[str] = None) -> Dict[str, Any]:
-        url = f"{self.base}/api/chat"
+    def _build_prompt_text(self, context: Dict[str, Any]) -> str:
+        messages = self._build_prompt(context)
+        # Flatten system+user into a single prompt for /api/generate compatibility
+        system = next((m.get('content') for m in messages if m.get('role') == 'system'), '')
+        user = next((m.get('content') for m in messages if m.get('role') == 'user'), '')
+        return f"{system}\n\n{user}"
+
+    def _call_generate(self, prompt: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+        url = f"{self.base}/api/generate"
         payload = {
             "model": self.model,
-            "messages": messages,
+            "prompt": prompt,
             "stream": False,
             "format": "json",
             "options": {
@@ -142,22 +158,20 @@ class LLMClassifier:
         data = resp.json()
         dt = time.monotonic() - t0
         logger.info(f"LLM response {len(resp.content)} bytes in {dt:.2f}s")
-
         # Debug dump
         if self.debug_dir:
             ts = int(time.time())
-            base = f"{entity_id or 'entity'}_{ts}"
+            safe_entity = (entity_id or 'entity').replace('/', '__').replace('..', '.')
+            base = f"{safe_entity}_{ts}"
             try:
-                with open(self.debug_dir / f"{base}_request.json", 'w', encoding='utf-8') as f:
+                with open(self.debug_dir / f"{base}_request_generate.json", 'w', encoding='utf-8') as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
-                with open(self.debug_dir / f"{base}_response.json", 'w', encoding='utf-8') as f:
+                with open(self.debug_dir / f"{base}_response_generate.json", 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 logger.warning(f"Failed to write LLM debug files: {e}")
-        content = data.get("message", {}).get("content", "").strip()
-        # Try to parse JSON from content directly
+        content = (data.get("response") or "").strip()
         try:
-            # Some models may wrap JSON in code fences, extract the JSON object region
             start = content.find('{')
             end = content.rfind('}')
             content_slice = content[start:end+1] if (start != -1 and end != -1 and end > start) else content
@@ -170,6 +184,74 @@ class LLMClassifier:
                 "role": "Unknown",
                 "confidence": 0.0,
             }
+
+    def _call_ollama(self, messages: List[Dict[str, str]], entity_id: Optional[str] = None) -> Dict[str, Any]:
+        # Try /api/chat first
+        url = f"{self.base}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "num_ctx": 1024,
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "num_predict": 64
+            }
+        }
+        try:
+            logger.info(f"LLM POST {url} model={self.model}")
+            t0 = time.monotonic()
+            resp = requests.post(url, json=payload, timeout=(self.connect_timeout, self.timeout))
+            if resp.status_code == 404:
+                # Fallback to generate API
+                prompt = self._build_prompt_text({
+                    'entity_id': entity_id,
+                    # rebuild context is not necessary here; caller will pass messages; use messages to build prompt
+                })
+                # Better: rebuild full prompt from messages
+                sys_content = next((m.get('content') for m in messages if m.get('role') == 'system'), '')
+                usr_content = next((m.get('content') for m in messages if m.get('role') == 'user'), '')
+                prompt = f"{sys_content}\n\n{usr_content}"
+                return self._call_generate(prompt, entity_id=entity_id)
+            resp.raise_for_status()
+            data = resp.json()
+            dt = time.monotonic() - t0
+            logger.info(f"LLM response {len(resp.content)} bytes in {dt:.2f}s")
+            # Debug dump
+            if self.debug_dir:
+                ts = int(time.time())
+                safe_entity = (entity_id or 'entity').replace('/', '__').replace('..', '.')
+                base = f"{safe_entity}_{ts}"
+                try:
+                    with open(self.debug_dir / f"{base}_request.json", 'w', encoding='utf-8') as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                    with open(self.debug_dir / f"{base}_response.json", 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.warning(f"Failed to write LLM debug files: {e}")
+            content = data.get("message", {}).get("content", "").strip()
+            try:
+                start = content.find('{')
+                end = content.rfind('}')
+                content_slice = content[start:end+1] if (start != -1 and end != -1 and end > start) else content
+                return json.loads(content_slice)
+            except Exception:
+                logger.warning("LLM returned non-JSON content; defaulting to Unknown")
+                return {
+                    "hamburg_related": False,
+                    "ce_related": False,
+                    "role": "Unknown",
+                    "confidence": 0.0,
+                }
+        except Exception as e:
+            logger.warning(f"/api/chat failed ({e}); falling back to /api/generate")
+            # Fallback to generate API
+            sys_content = next((m.get('content') for m in messages if m.get('role') == 'system'), '')
+            usr_content = next((m.get('content') for m in messages if m.get('role') == 'user'), '')
+            prompt = f"{sys_content}\n\n{usr_content}"
+            return self._call_generate(prompt, entity_id=entity_id)
 
     def classify_entity(self, context: Dict[str, Any]) -> LLMResult:
         msgs = self._build_prompt(context)
