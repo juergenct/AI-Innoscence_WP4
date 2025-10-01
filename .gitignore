@@ -23,6 +23,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Test Jupyter Notebook
+test.ipynb
+
 # Scrapy
 .scrapy
 
