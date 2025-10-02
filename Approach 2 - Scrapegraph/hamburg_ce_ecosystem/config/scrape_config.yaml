@@ -4,6 +4,8 @@ llm:
   model_tokens: 128000
   temperature: 0.0
   base_url: 'http://localhost:11434'
+  top_p: 0.1
+  repeat_penalty: 1.1
 
 scraper:
   headless: true

@@ -17,19 +17,25 @@ from hamburg_ce_ecosystem.config.prompts import EXTRACTION_PROMPT
 from hamburg_ce_ecosystem.models.entity import EcosystemRole, EntityProfile
 from hamburg_ce_ecosystem.utils.cache import FileCache
 from hamburg_ce_ecosystem.utils.logging_setup import setup_logging
+from hamburg_ce_ecosystem.utils.ollama_structured import call_ollama_chat, ExtractionResult
+from hamburg_ce_ecosystem.utils.web_fetcher import fetch_website_content
 
-EXTRACTION_SCHEMA: Dict[str, str] = {
-    "entity_name": "string",
-    "ecosystem_role": "string",
-    "contact_persons": "list[string]",
-    "emails": "list[string]",
-    "phone_numbers": "list[string]",
-    "brief_description": "string",
-    "ce_relation": "string",
-    "ce_activities": "list[string]",
-    "partners": "list[string]",
-    "partner_urls": "list[string]",
-    "address": "string",
+EXTRACTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "entity_name": {"type": "string"},
+        "ecosystem_role": {"type": "string"},
+        "contact_persons": {"type": "array", "items": {"type": "string"}},
+        "emails": {"type": "array", "items": {"type": "string"}},
+        "phone_numbers": {"type": "array", "items": {"type": "string"}},
+        "brief_description": {"type": "string"},
+        "ce_relation": {"type": "string"},
+        "ce_activities": {"type": "array", "items": {"type": "string"}},
+        "partners": {"type": "array", "items": {"type": "string"}},
+        "partner_urls": {"type": "array", "items": {"type": "string"}},
+        "address": {"type": "string"}
+    },
+    "required": ["entity_name", "ecosystem_role", "contact_persons", "emails", "phone_numbers", "brief_description", "ce_relation", "ce_activities", "partners", "partner_urls", "address"]
 }
 
 
@@ -209,22 +215,98 @@ class ExtractionScraper:
             except Exception:
                 pass
 
-        graph = SmartScraperGraph(
-            prompt=self.create_extraction_prompt(),
-            source=url,
-            config=self.config,
-            schema=EXTRACTION_SCHEMA
-        )
+        # TWO-STAGE LLM APPROACH: ScrapegraphAI extraction + Ollama structuring
+        
+        # Stage 1: ScrapegraphAI intelligently extracts information (no strict JSON required)
+        scrapegraph_prompt = """Extract ONLY information that is actually on this website. Do not generate or assume anything.
 
+BASIC INFO (check homepage, about):
+- Official organization/company name (exact text)
+- Organization type indicators: university/Hochschule, research institute/Forschungsinstitut, GmbH/AG/company, startup, e.V./NGO, government/Behörde, media, funding body, network
+- Description of what they do (copy exact text, 2-3 sentences)
+
+CONTACTS (check contact, team, about, impressum pages):
+- Names of key people with exact titles (copy as shown)
+- All email addresses (copy exactly)
+- All phone numbers (copy exactly)
+
+LOCATION (check contact, impressum, footer):
+- Complete physical address (copy exact text)
+- Street name and number
+- Postal code (must be 20000-22999 for Hamburg)
+
+CIRCULAR ECONOMY (check services, products, about, sustainability, projects):
+- Copy exact descriptions of CE contribution
+- Copy specific CE activities/services/products mentioned
+- Copy waste management, recycling, reuse, repair services
+- Copy sustainability certifications mentioned
+- Copy CE project names
+
+PARTNERSHIPS (check partners, about, collaboration, network pages):
+- Partner organization names (copy exactly)
+- Partner website URLs (copy full URLs!)
+- Collaboration project names
+- Network memberships
+
+Visit all relevant pages (homepage, /about, /team, /contact, /partners, /sustainability, /impressum). Return ONLY what you actually find on the pages."""
+        
+        graph = SmartScraperGraph(
+            prompt=scrapegraph_prompt,
+            source=url,
+            config=self.config
+        )
+        
+        try:
+            scrapegraph_output = graph.run()
+            # Convert to string - format doesn't matter
+            if isinstance(scrapegraph_output, dict):
+                extracted_text = json.dumps(scrapegraph_output, ensure_ascii=False, indent=2)
+            else:
+                extracted_text = str(scrapegraph_output)
+        except Exception as e:
+            # ERROR RECOVERY: Extract useful content from ScrapegraphAI's error message
+            # (Following pattern from GitHub issues #809, #324, #257)
+            error_msg = str(e)
+            
+            # ScrapegraphAI often puts the actual LLM output in the error message
+            if "Invalid json output:" in error_msg:
+                # Extract the content after "Invalid json output:"
+                parts = error_msg.split("Invalid json output:", 1)
+                if len(parts) > 1:
+                    extracted_text = parts[1].strip()
+                    # Remove "For troubleshooting..." footer
+                    if "For troubleshooting" in extracted_text:
+                        extracted_text = extracted_text.split("For troubleshooting")[0].strip()
+                    # Silent recovery - logged at DEBUG level only
+                    self.logger.debug(f"Recovered content from ScrapegraphAI error for {url}")
+                else:
+                    # No recoverable content, use Playwright fallback
+                    extracted_text = fetch_website_content(url, max_pages=4, timeout=30000)
+                    self.logger.debug(f"Using Playwright fallback for {url}")
+            else:
+                # Different error, use Playwright fallback
+                extracted_text = fetch_website_content(url, max_pages=4, timeout=30000)
+                self.logger.debug(f"Using Playwright fallback for {url}")
+
+        # Stage 2: Ollama + Pydantic structures the extracted information
+        model = self.config.get('llm', {}).get('model', 'llama3.1:8b').replace('ollama/', '')
+        base_url = self.config.get('llm', {}).get('base_url', 'http://localhost:11434')
+        
         last_exc: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                raw = graph.run()
-                result = self._coerce_result(raw)
+                # Ollama + Pydantic: structure the text into perfect JSON
+                pydantic_result = call_ollama_chat(
+                    prompt=self.create_extraction_prompt(),
+                    text_content=extracted_text,  # ← From ScrapegraphAI
+                    response_model=ExtractionResult,
+                    model=model,
+                    base_url=base_url,
+                    temperature=0.0
+                )
                 
-                # Validate required keys exist
-                if not result or 'entity_name' not in result:
-                    raise ValueError(f'Missing entity_name in result: {result}')
+                # Pydantic guarantees perfect structure!
+                result = pydantic_result.model_dump()
                 self.cache.set(cache_key, result)
                 role = self._determine_role(result.get('ecosystem_role'))
                 profile = EntityProfile(

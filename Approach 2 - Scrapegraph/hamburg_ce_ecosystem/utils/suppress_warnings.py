@@ -27,34 +27,24 @@ class FilteredOutput:
             '<think>',
             '</think>',
             '✨ Try enhanced version of ScrapegraphAI',
+            'Es sieht so aus',
+            'Das ist eine',
+            'This is a massive',
+            'This appears to be',
+            'Hier sind einige',
+            'I\'ll try to summarize',
+            'Overall, this text',
         ]
     
     def write(self, text):
-        # Only write if text doesn't contain suppressed patterns
-        # Also suppress any multi-line blocks that start with suppressed patterns
-        lines = text.split('\n')
-        filtered_lines = []
-        skip_block = False
+        # Aggressive filtering of error blocks
+        # Check if entire text chunk should be suppressed
+        if any(pattern in text for pattern in self.suppress_patterns):
+            # This is an error/noise block, suppress it entirely
+            return len(text)
         
-        for line in lines:
-            # Check if this line starts a block to suppress
-            if any(pattern in line for pattern in self.suppress_patterns):
-                skip_block = True
-                continue
-            
-            # If we're in a skip block, check if it ends (empty line or new content)
-            if skip_block:
-                if line.strip() == '' or line.startswith('Verification:') or line.startswith('Extraction:'):
-                    skip_block = False
-                else:
-                    continue
-            
-            filtered_lines.append(line)
-        
-        filtered_text = '\n'.join(filtered_lines)
-        if filtered_text:
-            return self.original_stream.write(filtered_text)
-        return len(text)
+        # If not suppressed, write it
+        return self.original_stream.write(text)
     
     def flush(self):
         return self.original_stream.flush()
