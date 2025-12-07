@@ -22,7 +22,7 @@ echo "✅ Data file found"
 echo "🚀 Launching Streamlit application..."
 echo ""
 echo "   The app will open in your browser at: http://localhost:8501"
-echo ""
+echo "-------------------------------"
 
 streamlit run app.py
 
