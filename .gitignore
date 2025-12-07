@@ -53,3 +53,37 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Files
+*.md 
+*.csv
+*.json
+*.parquet
+*.xlsx
+*.html
+*.log
+*.txt
+*.docx
+*.xml
+*.png
+*.jpg
+*.jpeg
+
+# No Data Directories
+hamburg_ce_ecosystem/data/
+cahul_ce_ecosystem/data/
+novi_sad_ce_ecosystem/data/
+
+Input/
+
+# No Archive
+Archive/
+
+# No .claude or .cache
+.claude/
+.cache/
+
+# No models
+models/
+
+test.ipynb
