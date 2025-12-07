@@ -49,7 +49,7 @@ def main():
     )
     parser.add_argument(
         '--google-api-key',
-        default='***REMOVED***',
+        default='',
         help='Google Maps API key'
     )
     parser.add_argument(
