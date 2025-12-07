@@ -37,7 +37,7 @@ scraper:
 geocoding:
   # Hybrid geocoding approach: Nominatim (free) + Google Maps (fallback)
   enable_google_maps_fallback: true
-  google_maps_api_key: '***REMOVED***'
+  google_maps_api_key: ''
 
 browser:
   headless: true
