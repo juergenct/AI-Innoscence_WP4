@@ -1,0 +1,12 @@
+scrapegraphai
+ollama
+pandas
+geopy
+pydantic
+beautifulsoup4
+networkx
+pyyaml
+tqdm
+playwright
+requests
+httpx  # Async HTTP client for faster I/O operations

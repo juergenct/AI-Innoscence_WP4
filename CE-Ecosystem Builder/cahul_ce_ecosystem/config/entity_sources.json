@@ -1,0 +1,21 @@
+{
+  "_note": "This file is a fallback source for entity URLs.",
+  "_instructions": "Replace with Cahul, Moldova-based circular economy organizations.",
+  "_usage": "The system will first look for data/input/entity_urls.json. This file is only used if entity_urls.json doesn't exist.",
+  "_format": {
+    "Role Category": [
+      "https://example-entity-1.md",
+      "https://example-entity-2.com"
+    ]
+  },
+  "Industry Partners": [],
+  "Researchers": [],
+  "Higher Education Institutions": [],
+  "Public Authorities": [],
+  "Non-Governmental Organizations": [],
+  "Startups and Entrepreneurs": [],
+  "Research Institutes": [],
+  "Policy Makers": [],
+  "Funding Bodies": [],
+  "Knowledge and Innovation Communities": []
+}

@@ -1,0 +1,92 @@
+# CAHUL CE ECOSYSTEM CONFIGURATION
+# Region: Cahul, Moldova
+# Languages: Romanian, Russian, English
+# LLM: Qwen2.5:32B for multilingual understanding (Romanian/Russian/English)
+
+llm:
+  model: 'ollama/qwen2.5:32b-instruct-q4_K_M'  # Multilingual support (Romanian/Russian/English)
+  model_provider: 'ollama'
+  model_tokens: 128000
+  temperature: 0.0
+  base_url: 'http://localhost:11434'
+  top_p: 0.1
+  repeat_penalty: 1.1
+
+# Region-specific settings
+region:
+  name: 'Cahul'
+  country: 'Moldova'
+  languages: ['Romanian', 'Russian', 'English']
+  scripts: ['Latin', 'Cyrillic']
+
+# Model configuration for different stages (optimization)
+verification:
+  model: 'ollama/qwen2.5:32b-instruct-q4_K_M'  # Upgraded to 32B for consistency (from 7B)
+
+extraction:
+  model: 'ollama/qwen2.5:32b-instruct-q4_K_M'  # Upgraded to 32B for better quality (from 14B)
+
+scraper:
+  headless: true
+  timeout: 30
+  verbose: false
+  max_retries: 3
+
+# Browser configuration for JavaScript rendering with Playwright
+# Geocoding configuration
+geocoding:
+  # Hybrid geocoding approach: Nominatim (free) + Google Maps (fallback)
+  enable_google_maps_fallback: true
+  google_maps_api_key: ''
+
+browser:
+  headless: true
+  args:
+    - '--disable-gpu'
+    - '--no-sandbox'
+    - '--disable-dev-shm-usage'
+
+# Loader configuration to enable Playwright for JavaScript-heavy sites
+loader_kwargs:
+  loader: "playwright"  # Use Playwright for JavaScript rendering
+  headless: true
+
+extraction:
+  chunk_size: 4000
+  overlap: 200
+
+# Discovered Entity Processing (Stage 2.5)
+discovered_entity_processing:
+  enable: true
+  max_discovery_depth: 3  # How many levels deep to discover entities (e.g., A -> B -> C -> D)
+  batch_size: 30  # Entities to process per deduplication batch
+  min_deduplication_confidence: 0.7  # Min confidence for LLM-based deduplication
+
+# Entity Matching (LLM-based semantic matching)
+entity_matching:
+  batch_size: 50  # Number of database entities to match against per batch
+  min_confidence: 0.6  # Minimum confidence for a match (0.6-0.8: likely, 0.8+: strong)
+
+# Relationship Analysis (O(n) approach)
+relationship_analysis:
+  # Note: O(n²) knowledge transfer analysis has been removed
+  # New approach:
+  # 1. LLM-based entity matching for partnerships (O(n))
+  # 2. Clustering capabilities, needs, activities (O(n))
+  # 3. Capability-need matching for synergies (O(clusters))
+
+  # Clustering settings
+  clustering:
+    enable: true
+    capability_clusters: 15  # Target number of capability clusters
+    need_clusters: 15  # Target number of need clusters
+    activity_clusters: 12  # Target number of activity clusters
+    batch_size: 60  # Max items per batch (fits in 4096 token window, ~3500 tokens for data)
+    max_prompt_tokens: 3500  # Safety limit for 4096 token context window
+    similarity_threshold: 0.80  # Threshold for merging similar clusters (0.0-1.0)
+
+  # Performance with O(n) approach:
+  # - 15K input → ~2.5K verified entities
+  # - Each entity processed once for partner matching
+  # - 3 clustering LLM calls (capabilities, needs, activities)
+  # - Total time: ~hours instead of days!

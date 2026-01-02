@@ -1,0 +1,82 @@
+# ===========================================
+# AI-InnoScEnCE WP4 - Git Ignore Configuration
+# ===========================================
+
+# Deployed frontend (separate repos)
+Streamlit Application/
+streamlit-deploy/
+
+# Large models and archives
+models/
+Archive/
+
+# Large data files
+*.db
+*.csv
+*.xml
+*.parquet
+*.xlsx
+
+# Data directories (can be regenerated)
+hamburg_ce_ecosystem/data/
+cahul_ce_ecosystem/data/
+novi_sad_ce_ecosystem/data/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+*.cache
+.scrapy
+
+# Claude
+.claude/
+
+# Test files
+test.ipynb
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# HTML files (scraped content)
+*.html
